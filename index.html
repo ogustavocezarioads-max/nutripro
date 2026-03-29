@@ -3541,29 +3541,52 @@ renderProfileUI(_p0);
 hydrateProfileFromPossibleLogin();
 if (document.getElementById('page-jornada')?.classList.contains('active')) atualizarJornadaGamificada();
 
-// ── PACIENTES (LOCALSTORAGE) ────────────────────────────────────────────────
-function getPacientes() {
-  try { return JSON.parse(localStorage.getItem('pacientes_v2') || '[]') || []; }
-  catch { return []; }
+// ── PACIENTES (SUPABASE + CACHE) ─────────────────────────────────────────────
+let _pacientes = [];
+let _evolucoes = [];
+let _consultas = [];
+let _contatos  = [];
+
+function getPacientes() { return _pacientes; }
+function getEvolucoes() { return _evolucoes; }
+function getConsultas() { return _consultas; }
+function getContatos()  { return _contatos;  }
+
+async function loadPacientesData() {
+  const uid = getUID();
+  if (!uid) return;
+  const [rp, re, rc, rct] = await Promise.all([
+    sb.from('pacientes').select('*').eq('user_id', uid).order('created_at', { ascending: false }),
+    sb.from('evolucoes').select('*').eq('user_id', uid),
+    sb.from('consultas').select('*').eq('user_id', uid),
+    sb.from('contatos').select('*').eq('user_id', uid)
+  ]);
+  _pacientes = rp.data || [];
+  _evolucoes = re.data || [];
+  _consultas = rc.data || [];
+  _contatos  = rct.data || [];
+  // Migração única: importar dados do localStorage se Supabase estiver vazio
+  if (!_pacientes.length) await _migratePacientesFromLocalStorage(uid);
 }
-function savePacientes(list) {
-  localStorage.setItem('pacientes_v2', JSON.stringify(list || []));
+
+async function _migratePacientesFromLocalStorage(uid) {
+  try {
+    const oldPac = JSON.parse(localStorage.getItem('pacientes_v2') || '[]');
+    if (!oldPac.length) return;
+    const pacs = oldPac.map(p => ({ ...p, user_id: uid }));
+    await sb.from('pacientes').insert(pacs);
+    const oldEvo = JSON.parse(localStorage.getItem('evolucoes_v1') || '[]');
+    if (oldEvo.length) await sb.from('evolucoes').insert(oldEvo.map(e => ({ ...e, user_id: uid })));
+    const oldCons = JSON.parse(localStorage.getItem('consultas_v1') || '[]');
+    if (oldCons.length) await sb.from('consultas').insert(oldCons.map(c => ({ ...c, user_id: uid })));
+    const oldCont = JSON.parse(localStorage.getItem('contatos_v1') || '[]');
+    if (oldCont.length) await sb.from('contatos').insert(oldCont.map(c => ({ ...c, user_id: uid })));
+    // Limpa localStorage após migração
+    ['pacientes_v2','evolucoes_v1','consultas_v1','contatos_v1'].forEach(k => localStorage.removeItem(k));
+    // Recarrega o cache com dados migrados
+    await loadPacientesData();
+  } catch(e) { console.error('Erro na migração de pacientes:', e); }
 }
-function getEvolucoes() {
-  try { return JSON.parse(localStorage.getItem('evolucoes_v1') || '[]') || []; }
-  catch { return []; }
-}
-function saveEvolucoes(list) { localStorage.setItem('evolucoes_v1', JSON.stringify(list||[])); }
-function getConsultas() {
-  try { return JSON.parse(localStorage.getItem('consultas_v1') || '[]') || []; }
-  catch { return []; }
-}
-function saveConsultas(list) { localStorage.setItem('consultas_v1', JSON.stringify(list||[])); }
-function getContatos() {
-  try { return JSON.parse(localStorage.getItem('contatos_v1') || '[]') || []; }
-  catch { return []; }
-}
-function saveContatos(list) { localStorage.setItem('contatos_v1', JSON.stringify(list||[])); }
 
 // Calcula status real da paciente com base nos dias sem registro de evolução
 function calcStatusPaciente(pac) {
@@ -3636,27 +3659,30 @@ function setPacienteFilter(f) {
   renderPacientes();
 }
 
-function loadPacientes() {
-  let list = getPacientes();
+async function loadPacientes() {
+  await loadPacientesData();
+  const list = getPacientes();
+  // Seed de demonstração para novos usuários (só se Supabase retornou vazio após migração)
   if (!list.length) {
+    const uid = getUID();
     const today = new Date().toISOString().split('T')[0];
     const d14 = new Date(); d14.setDate(d14.getDate()-14); const d14s = d14.toISOString().split('T')[0];
-    const d20 = new Date(); d20.setDate(d20.getDate()-20); const d20s = d20.toISOString().split('T')[0];
     const p1id = crypto.randomUUID(); const p2id = crypto.randomUUID(); const p3id = crypto.randomUUID();
-    savePacientes([
-      { id: p1id, nome: 'Ana Paula M.', objetivo: 'emagrecimento', tipo: 'programa', inicio: '2026-01-05', valor: 1200, status: 'ativo', obs: 'Programa 90d', prox_consulta: today, whats: '' },
-      { id: p2id, nome: 'Carla Souza', objetivo: 'saude-hormonal', tipo: 'programa', inicio: '2026-01-20', valor: 900, status: 'ativo', obs: '60d', prox_consulta: '', whats: '' },
-      { id: p3id, nome: 'Paula Mendes', objetivo: 'reeducacao', tipo: 'avulsa', inicio: '2025-11-10', valor: 300, status: 'ativo', obs: '', prox_consulta: '', whats: '' }
-    ]);
-    // seed: evolução recente para p1 e p2, mas não p3 (para gerar alerta)
-    const evos = getEvolucoes();
-    evos.push({ id: crypto.randomUUID(), paciente_id: p1id, data: today, peso: 72.5, humor: 'bem', obs: '' });
-    evos.push({ id: crypto.randomUUID(), paciente_id: p2id, data: d14s, peso: 65.0, humor: 'regular', obs: '' });
-    saveEvolucoes(evos);
-    list = getPacientes();
+    const seedPacs = [
+      { id: p1id, user_id: uid, nome: 'Ana Paula M.', objetivo: 'emagrecimento', tipo: 'programa', inicio: '2026-01-05', valor: 1200, status: 'ativo', obs: 'Programa 90d', prox_consulta: today, whats: '' },
+      { id: p2id, user_id: uid, nome: 'Carla Souza', objetivo: 'saude-hormonal', tipo: 'programa', inicio: '2026-01-20', valor: 900, status: 'ativo', obs: '60d', prox_consulta: null, whats: '' },
+      { id: p3id, user_id: uid, nome: 'Paula Mendes', objetivo: 'reeducacao', tipo: 'avulsa', inicio: '2025-11-10', valor: 300, status: 'ativo', obs: '', prox_consulta: null, whats: '' }
+    ];
+    const seedEvos = [
+      { id: crypto.randomUUID(), user_id: uid, paciente_id: p1id, data: today, peso: 72.5, humor: 'bem', obs: '' },
+      { id: crypto.randomUUID(), user_id: uid, paciente_id: p2id, data: d14s, peso: 65.0, humor: 'regular', obs: '' }
+    ];
+    await sb.from('pacientes').insert(seedPacs);
+    await sb.from('evolucoes').insert(seedEvos);
+    await loadPacientesData();
   }
-  renderStatusBar(list);
-  renderAlertsStrip(list);
+  renderStatusBar(getPacientes());
+  renderAlertsStrip(getPacientes());
   renderPacientes();
 }
 
@@ -3872,19 +3898,19 @@ function selectHumor(humor, btn) {
 }
 
 // ── EVOLUÇÃO ──
-function salvarEvolucao() {
+async function salvarEvolucao() {
   const data = document.getElementById('evo-data').value;
   const peso = parseFloat(document.getElementById('evo-peso').value);
   const obs  = document.getElementById('evo-obs').value.trim();
   if (!data || !peso) { showToast('Informe data e peso.'); return; }
-  const evos = getEvolucoes();
-  evos.push({ id: crypto.randomUUID(), paciente_id: _currentPacId, data, peso, humor: _humorSelecionado, obs });
-  saveEvolucoes(evos);
+  const novaEvo = { id: crypto.randomUUID(), user_id: getUID(), paciente_id: _currentPacId, data, peso, humor: _humorSelecionado, obs };
+  const { error } = await sb.from('evolucoes').insert(novaEvo);
+  if (error) { showToast('Erro ao salvar: ' + error.message); return; }
+  _evolucoes.push(novaEvo);
   document.getElementById('evo-peso').value = '';
   document.getElementById('evo-obs').value = '';
   renderEvolucaoList(_currentPacId);
   renderPesoChart(_currentPacId);
-  // Atualiza score
   const pac = getPacientes().find(p=>p.id===_currentPacId);
   if (pac) { const sc = calcScore(pac); const hf = document.getElementById('pd-health-fill'); if(hf) hf.className=`health-fill score-${sc}`; const hn = document.getElementById('pd-health-num'); if(hn) hn.textContent=sc; }
   showToast('✓ Registro salvo!');
@@ -3910,9 +3936,11 @@ function renderEvolucaoList(pacId) {
   `).join('');
 }
 
-function deleteEvolucao(id) {
+async function deleteEvolucao(id) {
   if (!confirm('Excluir este registro?')) return;
-  saveEvolucoes(getEvolucoes().filter(e=>e.id!==id));
+  const { error } = await sb.from('evolucoes').delete().eq('id', id).eq('user_id', getUID());
+  if (error) { showToast('Erro ao excluir: ' + error.message); return; }
+  _evolucoes = _evolucoes.filter(e => e.id !== id);
   renderEvolucaoList(_currentPacId);
   renderPesoChart(_currentPacId);
   showToast('Registro removido.');
@@ -3934,14 +3962,15 @@ function renderPesoChart(pacId) {
 }
 
 // ── CONSULTAS ──
-function salvarConsulta() {
+async function salvarConsulta() {
   const data = document.getElementById('cons-data').value;
   const status = document.getElementById('cons-status').value;
   const notas = document.getElementById('cons-notas').value.trim();
   if (!data) { showToast('Informe a data da consulta.'); return; }
-  const list = getConsultas();
-  list.push({ id: crypto.randomUUID(), paciente_id: _currentPacId, data, status, notas });
-  saveConsultas(list);
+  const novaConsulta = { id: crypto.randomUUID(), user_id: getUID(), paciente_id: _currentPacId, data, status, notas };
+  const { error } = await sb.from('consultas').insert(novaConsulta);
+  if (error) { showToast('Erro ao salvar: ' + error.message); return; }
+  _consultas.push(novaConsulta);
   document.getElementById('cons-notas').value = '';
   renderConsultasList(_currentPacId);
   showToast('✓ Consulta registrada!');
@@ -3970,21 +3999,24 @@ function renderConsultasList(pacId) {
   `).join('');
 }
 
-function deleteConsulta(id) {
+async function deleteConsulta(id) {
   if (!confirm('Excluir esta consulta?')) return;
-  saveConsultas(getConsultas().filter(c=>c.id!==id));
+  const { error } = await sb.from('consultas').delete().eq('id', id).eq('user_id', getUID());
+  if (error) { showToast('Erro ao excluir: ' + error.message); return; }
+  _consultas = _consultas.filter(c => c.id !== id);
   renderConsultasList(_currentPacId);
   showToast('Consulta removida.');
 }
 
 // ── CONTATOS ──
-function salvarContato() {
+async function salvarContato() {
   const canal = document.getElementById('cont-canal').value;
   const resultado = document.getElementById('cont-resultado').value;
   const data = new Date().toISOString().split('T')[0];
-  const list = getContatos();
-  list.push({ id: crypto.randomUUID(), paciente_id: _currentPacId, data, canal, resultado });
-  saveContatos(list);
+  const novoContato = { id: crypto.randomUUID(), user_id: getUID(), paciente_id: _currentPacId, data, canal, resultado };
+  const { error } = await sb.from('contatos').insert(novoContato);
+  if (error) { showToast('Erro ao salvar: ' + error.message); return; }
+  _contatos.push(novoContato);
   renderContatosList(_currentPacId);
   showToast('✓ Contato registrado!');
 }
@@ -4006,13 +4038,12 @@ function renderContatosList(pacId) {
 }
 
 // ── OBSERVAÇÕES ──
-function salvarObsPaciente() {
+async function salvarObsPaciente() {
   const obs = document.getElementById('pd-obs-edit').value.trim();
-  const list = getPacientes();
-  const idx = list.findIndex(p=>p.id===_currentPacId);
-  if (idx === -1) return;
-  list[idx].obs = obs;
-  savePacientes(list);
+  const { error } = await sb.from('pacientes').update({ obs }).eq('id', _currentPacId).eq('user_id', getUID());
+  if (error) { showToast('Erro ao salvar: ' + error.message); return; }
+  const idx = _pacientes.findIndex(p => p.id === _currentPacId);
+  if (idx !== -1) _pacientes[idx].obs = obs;
   showToast('✓ Observações salvas!');
 }
 
@@ -4070,7 +4101,7 @@ function openPacienteModal() {
 }
 function closePacienteModal() { document.getElementById('paciente-modal-overlay')?.classList.remove('open'); }
 
-function salvarPaciente() {
+async function salvarPaciente() {
   const nome = document.getElementById('p-nome').value.trim();
   const objetivo = document.getElementById('p-objetivo').value;
   const tipo = document.getElementById('p-tipo').value;
@@ -4081,19 +4112,26 @@ function salvarPaciente() {
   const whats = document.getElementById('p-whats').value.trim();
   const obs = document.getElementById('p-obs').value.trim();
   if (!nome) { showToast('Informe o nome da paciente.'); return; }
-  const list = getPacientes();
-  list.unshift({ id: crypto.randomUUID(), nome, objetivo, tipo, status, inicio: inicio||null, prox_consulta: prox_consulta||null, valor: valor||null, whats: whats||'', obs: obs||null });
-  savePacientes(list);
+  const novaPac = { id: crypto.randomUUID(), user_id: getUID(), nome, objetivo, tipo, status, inicio: inicio||null, prox_consulta: prox_consulta||null, valor: valor||null, whats: whats||'', obs: obs||null };
+  const { error } = await sb.from('pacientes').insert(novaPac);
+  if (error) { showToast('Erro ao salvar: ' + error.message); return; }
+  _pacientes.unshift(novaPac);
   closePacienteModal();
   ['p-nome','p-valor','p-obs','p-whats'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=''; });
-  loadPacientes();
+  renderStatusBar(getPacientes());
+  renderAlertsStrip(getPacientes());
+  renderPacientes();
   showToast('✓ Paciente adicionada!');
 }
 
-function deletePaciente(id) {
+async function deletePaciente(id) {
   if (!confirm('Excluir esta paciente?')) return;
-  savePacientes(getPacientes().filter(p => p.id !== id));
-  loadPacientes();
+  const { error } = await sb.from('pacientes').delete().eq('id', id).eq('user_id', getUID());
+  if (error) { showToast('Erro ao excluir: ' + error.message); return; }
+  _pacientes = _pacientes.filter(p => p.id !== id);
+  renderStatusBar(getPacientes());
+  renderAlertsStrip(getPacientes());
+  renderPacientes();
   showToast('Paciente removida.');
 }
 
