@@ -1038,7 +1038,6 @@ button, .nav-item, .nav-sub-item, .filter-btn, .agent-cta,
     <div class="topbar-title" id="topbar-title">Painel</div>
     <div style="display:flex;gap:8px">
       <button class="btn-icon" onclick="showToast('🔔 Notificações disponíveis em breve!')" title="Notificações" aria-label="Notificações">🔔</button>
-      <button class="btn-icon" onclick="window.open('https://wa.me/55SEUNUMERO?text=Olá!%20Preciso%20de%20ajuda%20com%20o%20NutriPro.','_blank')" title="Suporte via WhatsApp" aria-label="Ajuda">?</button>
     </div>
   </header>
 
@@ -2178,6 +2177,11 @@ let _currentAgent = null;
 const SUPABASE_URL = 'https://bqyrtazdtzktqzykfmux.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_zyvbvu9hdFwXOLY6E1P5zQ_uqusVwzP';
 let sb;
+
+// ── XSS: escapa strings antes de inserir em innerHTML ──
+function escHtml(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 try {
   sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 } catch(e) {
@@ -2196,18 +2200,62 @@ async function loadPlanoFromSupabase() {
   try {
     const uid = getUID();
     if (!uid) return;
-    const { data } = await sb.from('consultorio').select('plano').eq('user_id', uid).maybeSingle();
-    if (data?.plano) {
-      _planoAtual = data.plano.toLowerCase();
+    const { data } = await sb.from('consultorio').select('*').eq('user_id', uid).maybeSingle();
+
+    // Plano
+    _planoAtual = data?.plano ? data.plano.toLowerCase() : 'essencial';
+    const planoLabel = _planoAtual.charAt(0).toUpperCase() + _planoAtual.slice(1);
+
+    // ── Perfil ──
+    if (data?.nome) {
+      // Supabase é a fonte de verdade
+      _profile = {
+        name: data.nome || '',
+        cidade: data.cidade || '',
+        especialidade: data.especialidade || '',
+        crn: data.crn || '',
+        plano: planoLabel,
+        photo: data.photo || ''
+      };
+      localStorage.setItem(PROFILE_KEY, JSON.stringify(_profile));
     } else {
-      _planoAtual = 'essencial';
+      // Tenta migrar do localStorage → Supabase (migração única)
+      const localP = _loadProfileFromLocalStorage();
+      if (localP.name) {
+        await sb.from('consultorio').upsert({
+          user_id: uid,
+          nome: localP.name,
+          cidade: localP.cidade || '',
+          especialidade: localP.especialidade || '',
+          crn: localP.crn || '',
+          photo: localP.photo || ''
+        }, { onConflict: 'user_id' }).then(({ error }) => {
+          if (error) console.warn('Erro migração perfil:', error);
+        });
+      }
+      _profile = { ...localP, plano: planoLabel };
+      localStorage.setItem(PROFILE_KEY, JSON.stringify(_profile));
     }
-    // Sincroniza com localStorage para exibição na sidebar
-    const p = loadProfile();
-    p.plano = _planoAtual.charAt(0).toUpperCase() + _planoAtual.slice(1);
-    saveProfile(p);
+
+    // ── Jornada Progresso ──
+    if (data?.jornada_progresso && Object.keys(data.jornada_progresso).length > 0) {
+      _jornadaProgresso = data.jornada_progresso;
+      localStorage.setItem('jornada-progresso', JSON.stringify(_jornadaProgresso));
+    } else {
+      // Tenta migrar do localStorage → Supabase (migração única)
+      const localJ = JSON.parse(localStorage.getItem('jornada-progresso') || '{}');
+      if (Object.keys(localJ).length > 0) {
+        _jornadaProgresso = localJ;
+        await sb.from('consultorio').upsert({
+          user_id: uid,
+          jornada_progresso: localJ
+        }, { onConflict: 'user_id' }).then(({ error }) => {
+          if (error) console.warn('Erro migração jornada:', error);
+        });
+      }
+    }
   } catch(e) {
-    console.warn('Erro ao carregar plano:', e);
+    console.warn('Erro ao carregar dados do consultório:', e);
     _planoAtual = 'essencial';
   }
 }
@@ -2495,19 +2543,13 @@ function showApp() {
   if (resetPage) resetPage.classList.add('hidden');
   if (mainEl) mainEl.style.display = '';
   if (sidebarEl) sidebarEl.style.display = '';
-  // Carrega plano do Supabase ANTES de renderizar a interface
+  // Carrega consultório do Supabase ANTES de renderizar a interface
   loadPlanoFromSupabase().then(() => {
     navigate('painel', document.querySelector('.nav-item'));
     loadPainelStats();
     initMonthPicker();
     startMotivationRotator();
-    const p0 = loadProfile();
-    renderProfileUI(p0);
-    if (!p0.name && getUserEmail()) {
-      p0.email = getUserEmail();
-      saveProfile(p0);
-      renderProfileUI(p0);
-    }
+    renderProfileUI(loadProfile());
   });
 }
 
@@ -2584,8 +2626,10 @@ let pacienteFilter = 'todos';
 const MESES = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
 
 
-// ── PERFIL (localStorage) ──
+// ── PERFIL (cache + Supabase) ──
 const PROFILE_KEY = 'nutri_profile_v1';
+let _profile = null;
+let _jornadaProgresso = {};
 let currentProfilePhotoDataUrl = '';
 
 function getInitials(name){
@@ -2596,7 +2640,7 @@ function getInitials(name){
   const last = (parts.length>1 ? parts[parts.length-1][0] : '') || '';
   return (first + last).toUpperCase();
 }
-function loadProfile(){
+function _loadProfileFromLocalStorage(){
   try{
     const raw = localStorage.getItem(PROFILE_KEY);
     if (!raw) return { name:'', cidade:'', especialidade:'', crn:'', plano:'essencial', photo:'' };
@@ -2606,9 +2650,28 @@ function loadProfile(){
     return { name:'', cidade:'', especialidade:'', crn:'', plano:'essencial', photo:'' };
   }
 }
+function loadProfile(){
+  if (_profile) return { ..._profile };
+  return _loadProfileFromLocalStorage();
+}
 function saveProfile(profile){
+  _profile = { ...profile };
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
   renderProfileUI(profile);
+  // Persiste no Supabase (best-effort, assíncrono)
+  const uid = getUID();
+  if (uid && sb?.from) {
+    sb.from('consultorio').upsert({
+      user_id: uid,
+      nome: profile.name || '',
+      cidade: profile.cidade || '',
+      especialidade: profile.especialidade || '',
+      crn: profile.crn || '',
+      photo: profile.photo || ''
+    }, { onConflict: 'user_id' }).then(({ error }) => {
+      if (error) console.warn('Erro ao salvar perfil:', error);
+    });
+  }
 }
 function detectGender(name){
   // Detecta gênero pelo primeiro nome: terminação em 'a' = feminino
@@ -2630,7 +2693,7 @@ function renderProfileUI(profile){
   const greeting = document.getElementById('welcome-greeting');
   if (greeting) {
     greeting.innerHTML = (gender === 'f' ? 'Bem-vinda de volta, ' : 'Bem-vindo de volta, ') +
-      '<span class="welcome-name" id="welcome-name">' + displayName + '</span>';
+      '<span class="welcome-name" id="welcome-name">' + escHtml(displayName) + '</span>';
   } else {
     const w = document.getElementById('welcome-name');
     if (w) w.textContent = displayName;
@@ -3174,8 +3237,8 @@ function renderLancamentos() {
   tbody.innerHTML = filtered.map(l => `
     <tr>
       <td><span class="badge ${l.tipo}">${l.tipo === 'entrada' ? '↑ Entrada' : '↓ Saída'}</span></td>
-      <td><strong>${l.descricao}</strong>${l.paciente?`<br><span style="font-size:11px;color:var(--text-3)">${l.paciente}</span>`:''}</td>
-      <td style="color:var(--text-2)">${l.categoria||'—'}</td>
+      <td><strong>${escHtml(l.descricao)}</strong>${l.paciente?`<br><span style="font-size:11px;color:var(--text-3)">${escHtml(l.paciente)}</span>`:''}</td>
+      <td style="color:var(--text-2)">${escHtml(l.categoria||'—')}</td>
       <td style="color:var(--text-2)">${fmtDate(l.data)}</td>
       <td style="font-weight:600;color:${l.tipo==='entrada'?'var(--green)':'var(--red)'}">${l.tipo==='entrada'?'+':'−'} ${fmt(l.valor)}</td>
       <td><span class="badge ${l.status}">${statusLabel(l)}</span></td>
@@ -3267,12 +3330,21 @@ async function salvarLancamento() {
 
 // ── GAMIFICAÇÃO JORNADA (5 etapas) ──
 function getJornadaProgresso() {
-  try {
-    return JSON.parse(localStorage.getItem('jornada-progresso') || '{}');
-  } catch(e) { return {}; }
+  return { ..._jornadaProgresso };
 }
 function saveJornadaProgresso(obj) {
+  _jornadaProgresso = { ...obj };
   localStorage.setItem('jornada-progresso', JSON.stringify(obj));
+  // Persiste no Supabase (best-effort, assíncrono)
+  const uid = getUID();
+  if (uid && sb?.from) {
+    sb.from('consultorio').upsert({
+      user_id: uid,
+      jornada_progresso: obj
+    }, { onConflict: 'user_id' }).then(({ error }) => {
+      if (error) console.warn('Erro ao salvar jornada:', error);
+    });
+  }
 }
 
 function atualizarJornadaGamificada() {
@@ -3462,7 +3534,7 @@ function renderProdutosSupabase(produtos) {
   lista.innerHTML = produtos.map((p, i) => `
     <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:var(--surface-2);border-radius:8px;margin-bottom:8px">
       <div>
-        <div style="font-weight:600">${p.nome}</div>
+        <div style="font-weight:600">${escHtml(p.nome)}</div>
         <div style="font-size:12px;color:var(--text-3)">${fmt(p.valor)}</div>
       </div>
       <button class="btn-delete" onclick="removerProdutoSupabase(${i})">✕</button>
@@ -3700,7 +3772,7 @@ function renderAlertsStrip(list) {
   if (!strip || !alertList) return;
   // Alertas automáticos = funcionalidade Plano Retenção
   if (!isRetencao()) {
-    alertList.innerHTML = `<div style="color:rgba(255,255,255,0.6);font-size:13px;padding:8px 0">🔒 Alertas automáticos disponíveis no <strong style="color:var(--gold)">Plano Retenção</strong>. <a href="#" onclick="showUpgradeModal()" style="color:var(--gold);text-decoration:underline">Fazer upgrade →</a></div>`;
+    alertList.innerHTML = `<div style="color:rgba(255,255,255,0.6);font-size:13px;padding:8px 0">🔒 Alertas automáticos disponíveis no <strong style="color:var(--gold)">Plano Retenção</strong>. <a href="#" onclick="showUpgradeModal('Alertas Automáticos','retencao')" style="color:var(--gold);text-decoration:underline">Fazer upgrade →</a></div>`;
     strip.classList.add('visible');
     return;
   }
@@ -3759,16 +3831,16 @@ function renderPacientes() {
     const dias = diasSemContato(p);
     const score = calcScore(p);
     const initials = (p.nome||'').split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
-    const objetivo = objMap[p.objetivo] || p.objetivo || '—';
+    const objetivo = escHtml(objMap[p.objetivo] || p.objetivo || '—');
     const diasTxt = dias < 999 ? (dias === 0 ? 'hoje' : `há ${dias}d`) : 'sem registro';
     const stars = '★'.repeat(score) + '☆'.repeat(5-score);
     const badgeClass = status === 'ativo' ? 'badge-ativo' : status === 'risco' ? 'badge-risco' : 'badge-inativo';
     const badgeTxt = status === 'ativo' ? 'Ativo' : status === 'risco' ? 'Em Risco' : 'Inativo';
     return `
       <div class="pac-card ${status}" onclick="openPacienteDetalhe('${p.id}')">
-        <div class="pac-card-avatar">${initials}</div>
+        <div class="pac-card-avatar">${escHtml(initials)}</div>
         <div class="pac-card-main">
-          <div class="pac-card-name">${p.nome}</div>
+          <div class="pac-card-name">${escHtml(p.nome)}</div>
           <div class="pac-card-meta">
             <span>🎯 ${objetivo}</span>
             <span>💰 ${p.valor ? fmt(p.valor) : '—'}</span>
@@ -3928,9 +4000,9 @@ function renderEvolucaoList(pacId) {
   list.innerHTML = evos.map(e => `
     <div class="evolucao-item">
       <div class="evo-date">${fmtDate(e.data)}</div>
-      <div class="evo-peso">${e.peso}kg</div>
+      <div class="evo-peso">${escHtml(e.peso)}kg</div>
       <div class="evo-humor">${humorIcon[e.humor]||'—'}</div>
-      <div class="evo-obs">${e.obs||'—'}</div>
+      <div class="evo-obs">${escHtml(e.obs||'—')}</div>
       <button class="evo-delete" onclick="deleteEvolucao('${e.id}')">✕</button>
     </div>
   `).join('');
@@ -3991,8 +4063,8 @@ function renderConsultasList(pacId) {
     <div class="consulta-item">
       <div class="consulta-icon ${c.status}">${iconMap[c.status]||'📅'}</div>
       <div class="consulta-info">
-        <div class="consulta-date">${fmtDate(c.data)} <span class="consulta-badge ${badgeMap[c.status]||''}">${lblMap[c.status]||c.status}</span></div>
-        ${c.notas?`<div class="consulta-notas">${c.notas}</div>`:''}
+        <div class="consulta-date">${fmtDate(c.data)} <span class="consulta-badge ${badgeMap[c.status]||''}">${lblMap[c.status]||escHtml(c.status)}</span></div>
+        ${c.notas?`<div class="consulta-notas">${escHtml(c.notas)}</div>`:''}
       </div>
       <button class="evo-delete" onclick="deleteConsulta('${c.id}')">✕</button>
     </div>
@@ -4050,42 +4122,47 @@ async function salvarObsPaciente() {
 // ── WHATSAPP GENERATOR ──
 function gerarMensagemWhats() {
   if (!exigirPlano('retencao', 'Gerador de Mensagem WhatsApp IA')) return;
-  const pac = getPacientes().find(p=>p.id===_currentPacId);
-  if (!pac) return;
-  const dias = diasSemContato(pac);
-  const evos = getEvolucoes().filter(e=>e.paciente_id===pac.id).sort((a,b)=>b.data.localeCompare(a.data));
-  const ultimoHumor = evos.length ? evos[0].humor : null;
-  const objMap = { emagrecimento:'seu processo de emagrecimento', 'ganho-massa':'seu ganho de massa', reeducacao:'sua reeducação alimentar', 'saude-hormonal':'sua saúde hormonal', 'pos-gestacao':'sua recuperação pós-gestação', performance:'sua performance', outro:'seu objetivo' };
-  const objetivo = objMap[pac.objetivo] || 'seu objetivo';
-  const primeiroNome = (pac.nome||'').split(' ')[0];
+  try {
+    const pac = getPacientes().find(p=>p.id===_currentPacId);
+    if (!pac) return;
+    const dias = diasSemContato(pac);
+    const evos = getEvolucoes().filter(e=>e.paciente_id===pac.id).sort((a,b)=>b.data.localeCompare(a.data));
+    const ultimoHumor = evos.length ? evos[0].humor : null;
+    const objMap = { emagrecimento:'seu processo de emagrecimento', 'ganho-massa':'seu ganho de massa', reeducacao:'sua reeducação alimentar', 'saude-hormonal':'sua saúde hormonal', 'pos-gestacao':'sua recuperação pós-gestação', performance:'sua performance', outro:'seu objetivo' };
+    const objetivo = objMap[pac.objetivo] || 'seu objetivo';
+    const primeiroNome = (pac.nome||'').split(' ')[0];
 
-  let msg = '';
-  if (dias > 20) {
-    msg = `Oi ${primeiroNome}! 💚 Estava com saudade de saber como você está. Faz um tempinho que não nos falamos e queria entender como você está se sentindo com ${objetivo}. A gente pode retomar quando você quiser — estou aqui para te apoiar!`;
-  } else if (dias > 10) {
-    msg = `Oi ${primeiroNome}! 😊 Passando para saber como você está se sentindo essa semana. Como está ${objetivo}? Me conta novidades!`;
-  } else if (ultimoHumor === 'dificil') {
-    msg = `Oi ${primeiroNome}! Fiquei pensando em você. Sei que às vezes o processo tem semanas mais difíceis — isso é completamente normal! Quer conversar um pouco sobre como está se sentindo? Estou aqui 💚`;
-  } else if (pac.prox_consulta) {
-    const diff = Math.floor((new Date(pac.prox_consulta) - new Date()) / 86400000);
-    if (diff >= 0 && diff <= 2) {
-      msg = `Oi ${primeiroNome}! Só passando para confirmar nossa consulta ${diff===0?'de hoje':diff===1?'de amanhã':'dos próximos dias'}. 📅 Se puder, anota o peso antes da gente conversar. Te vejo em breve!`;
+    let msg = '';
+    if (dias > 20) {
+      msg = `Oi ${primeiroNome}! 💚 Estava com saudade de saber como você está. Faz um tempinho que não nos falamos e queria entender como você está se sentindo com ${objetivo}. A gente pode retomar quando você quiser — estou aqui para te apoiar!`;
+    } else if (dias > 10) {
+      msg = `Oi ${primeiroNome}! 😊 Passando para saber como você está se sentindo essa semana. Como está ${objetivo}? Me conta novidades!`;
+    } else if (ultimoHumor === 'dificil') {
+      msg = `Oi ${primeiroNome}! Fiquei pensando em você. Sei que às vezes o processo tem semanas mais difíceis — isso é completamente normal! Quer conversar um pouco sobre como está se sentindo? Estou aqui 💚`;
+    } else if (pac.prox_consulta) {
+      const diff = Math.floor((new Date(pac.prox_consulta) - new Date()) / 86400000);
+      if (diff >= 0 && diff <= 2) {
+        msg = `Oi ${primeiroNome}! Só passando para confirmar nossa consulta ${diff===0?'de hoje':diff===1?'de amanhã':'dos próximos dias'}. 📅 Se puder, anota o peso antes da gente conversar. Te vejo em breve!`;
+      } else {
+        msg = `Oi ${primeiroNome}! Tudo bem? Estava aqui revisando sua evolução e queria saber como você está se saindo com ${objetivo}. Qualquer dúvida pode me chamar! 🌿`;
+      }
     } else {
-      msg = `Oi ${primeiroNome}! Tudo bem? Estava aqui revisando sua evolução e queria saber como você está se saindo com ${objetivo}. Qualquer dúvida pode me chamar! 🌿`;
+      msg = `Oi ${primeiroNome}! 🌱 Tudo bem por aí? Passando para saber como você está se sentindo com ${objetivo}. Continua firme no plano?`;
     }
-  } else {
-    msg = `Oi ${primeiroNome}! 🌱 Tudo bem por aí? Passando para saber como você está se sentindo com ${objetivo}. Continua firme no plano?`;
-  }
 
-  const preview = document.getElementById('pd-whats-preview');
-  const textoEl = document.getElementById('pd-whats-texto');
-  const linkEl = document.getElementById('pd-whats-link');
-  if (textoEl) textoEl.textContent = msg;
-  if (preview) preview.style.display = 'block';
-  // Link WhatsApp
-  const numero = (pac.whats||'').replace(/\D/g,'');
-  const url = `https://wa.me/${numero ? '55'+numero : ''}?text=${encodeURIComponent(msg)}`;
-  if (linkEl) { linkEl.href = url; if(!numero) linkEl.style.opacity='0.5'; }
+    const preview = document.getElementById('pd-whats-preview');
+    const textoEl = document.getElementById('pd-whats-texto');
+    const linkEl = document.getElementById('pd-whats-link');
+    if (textoEl) textoEl.textContent = msg;
+    if (preview) preview.style.display = 'block';
+    // Link WhatsApp
+    const numero = (pac.whats||'').replace(/\D/g,'');
+    const url = `https://wa.me/${numero ? '55'+numero : ''}?text=${encodeURIComponent(msg)}`;
+    if (linkEl) { linkEl.href = url; if(!numero) linkEl.style.opacity='0.5'; }
+  } catch(e) {
+    console.error('gerarMensagemWhats:', e);
+    showToast('Erro ao gerar mensagem. Tente novamente.');
+  }
 }
 
 function copiarMensagem() {
